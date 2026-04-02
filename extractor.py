@@ -6,6 +6,7 @@ import requests
 import zipfile
 import time
 import re
+import random
 from io import BytesIO
 from pathlib import Path
 from docx import Document
@@ -71,7 +72,7 @@ chunk_size = st.sidebar.slider(
     "4. Chunk size (characters per AI request)",
     min_value=4000,
     max_value=25000,
-    value=12000,
+    value=15000,
     step=1000,
     help="Smaller chunks reduce timeout risk but increase number of API calls.",
 )
@@ -88,7 +89,7 @@ max_retries = st.sidebar.slider(
     "6. Retries per chunk",
     min_value=0,
     max_value=5,
-    value=2,
+    value=1,
     step=1,
 )
 
@@ -99,6 +100,24 @@ direct_parse_mode = st.sidebar.selectbox(
         "Always use AI",
     ],
     index=0,
+)
+
+inter_chunk_delay = st.sidebar.slider(
+    "8. Delay between AI chunk requests (seconds)",
+    min_value=0.0,
+    max_value=5.0,
+    value=1.5,
+    step=0.5,
+    help="Helps reduce 429 Too Many Requests errors.",
+)
+
+inter_file_delay = st.sidebar.slider(
+    "9. Delay between files (seconds)",
+    min_value=0.0,
+    max_value=10.0,
+    value=1.0,
+    step=0.5,
+    help="Helps reduce bursts when processing many files.",
 )
 
 run_button = st.sidebar.button("🚀 Process Files", type="primary")
@@ -125,10 +144,6 @@ def normalize_cell_value(value):
 
 
 def preserve_original_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Clean dataframe while preserving original column names and values.
-    No translation or renaming is performed.
-    """
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -138,12 +153,8 @@ def preserve_original_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
         df[col] = df[col].map(normalize_cell_value)
 
-    # Drop fully empty rows
     df = df.loc[~(df.apply(lambda row: all(v == "" for v in row), axis=1))].copy()
-
-    # Drop duplicate rows
     df = df.drop_duplicates().reset_index(drop=True)
-
     return df
 
 
@@ -177,7 +188,7 @@ def clean_llm_json(text_response: str) -> str:
     return text_response.strip()
 
 
-def chunk_text(text: str, max_chars: int = 12000):
+def chunk_text(text: str, max_chars: int = 15000):
     if not text:
         return []
 
@@ -203,10 +214,6 @@ def chunk_text(text: str, max_chars: int = 12000):
 
 
 def looks_like_useful_table(df: pd.DataFrame) -> bool:
-    """
-    Structural heuristic only.
-    Language-agnostic by design.
-    """
     if df is None or df.empty:
         return False
 
@@ -223,10 +230,7 @@ def looks_like_useful_table(df: pd.DataFrame) -> bool:
     if non_empty_cells < max(6, rows * 2):
         return False
 
-    if rows >= 2 and cols >= 2:
-        return True
-
-    return False
+    return rows >= 2 and cols >= 2
 
 
 # ------------------------------------------------------------
@@ -520,6 +524,12 @@ def call_gemini_once(api_key: str, prompt: str, timeout_seconds: int):
         timeout=timeout_seconds,
     )
 
+    if response.status_code == 429:
+        raise requests.exceptions.HTTPError(
+            "429 Too Many Requests",
+            response=response
+        )
+
     response.raise_for_status()
     res_json = response.json()
 
@@ -553,26 +563,58 @@ def call_gemini_with_retry(api_key: str, prompt: str, timeout_seconds: int, max_
     for attempt in range(max_retries + 1):
         try:
             return call_gemini_once(api_key, prompt, timeout_seconds)
-        except requests.exceptions.ReadTimeout as exc:
-            last_error = exc
-        except requests.exceptions.ConnectionError as exc:
-            last_error = exc
+
         except requests.exceptions.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
-            if status_code in [429, 500, 502, 503, 504]:
+
+            if status_code == 429:
                 last_error = exc
-            else:
-                raise
-        except Exception:
+                if attempt < max_retries:
+                    sleep_seconds = min(60, (2 ** attempt) + random.uniform(1.0, 3.0))
+                    time.sleep(sleep_seconds)
+                    continue
+                raise RuntimeError(
+                    "Gemini API rate limit reached (429 Too Many Requests). "
+                    "Please wait a bit and try again, or process fewer files/chunks at once."
+                )
+
+            if status_code in [500, 502, 503, 504]:
+                last_error = exc
+                if attempt < max_retries:
+                    sleep_seconds = min(30, (2 ** attempt) + random.uniform(0.5, 2.0))
+                    time.sleep(sleep_seconds)
+                    continue
+                raise RuntimeError(f"Gemini server error after retries: HTTP {status_code}")
+
             raise
 
-        if attempt < max_retries:
-            time.sleep(2 ** attempt)
+        except requests.exceptions.ReadTimeout as exc:
+            last_error = exc
+            if attempt < max_retries:
+                sleep_seconds = min(30, (2 ** attempt) + random.uniform(0.5, 2.0))
+                time.sleep(sleep_seconds)
+                continue
+            raise RuntimeError(
+                "Gemini request timed out. Try a smaller chunk size or retry later."
+            )
+
+        except requests.exceptions.ConnectionError as exc:
+            last_error = exc
+            if attempt < max_retries:
+                sleep_seconds = min(30, (2 ** attempt) + random.uniform(0.5, 2.0))
+                time.sleep(sleep_seconds)
+                continue
+            raise RuntimeError(
+                "Network connection error while contacting Gemini."
+            )
+
+        except Exception:
+            raise
 
     raise last_error if last_error else RuntimeError("Gemini call failed.")
 
 
-def process_file_with_ai(uploaded_file, api_key: str, chunk_size: int, timeout_seconds: int, max_retries: int):
+def process_file_with_ai(uploaded_file, api_key: str, chunk_size: int, timeout_seconds: int, max_retries: int, inter_chunk_delay: float):
     extracted_text, error = extract_text_for_llm(uploaded_file)
     if error:
         return None, error, []
@@ -626,6 +668,9 @@ def process_file_with_ai(uploaded_file, api_key: str, chunk_size: int, timeout_s
 
         chunk_progress.progress(idx / len(text_chunks))
 
+        if idx < len(text_chunks) and inter_chunk_delay > 0:
+            time.sleep(inter_chunk_delay)
+
     final_df = merge_dfs(dfs)
     return final_df, None, per_chunk_logs
 
@@ -646,7 +691,15 @@ def try_direct_parse(uploaded_file):
     return pd.DataFrame(), "not_applicable"
 
 
-def process_uploaded_file(uploaded_file, api_key: str, chunk_size: int, timeout_seconds: int, max_retries: int, direct_parse_mode: str):
+def process_uploaded_file(
+    uploaded_file,
+    api_key: str,
+    chunk_size: int,
+    timeout_seconds: int,
+    max_retries: int,
+    direct_parse_mode: str,
+    inter_chunk_delay: float,
+):
     used_method = ""
     chunk_logs = []
 
@@ -664,6 +717,7 @@ def process_uploaded_file(uploaded_file, api_key: str, chunk_size: int, timeout_
         chunk_size=chunk_size,
         timeout_seconds=timeout_seconds,
         max_retries=max_retries,
+        inter_chunk_delay=inter_chunk_delay,
     )
     return ai_df, error, chunk_logs, "ai_extraction"
 
@@ -694,6 +748,7 @@ if run_button:
                     timeout_seconds=timeout_seconds,
                     max_retries=max_retries,
                     direct_parse_mode=direct_parse_mode,
+                    inter_chunk_delay=inter_chunk_delay,
                 )
 
                 if error:
@@ -732,6 +787,9 @@ if run_button:
                 )
 
             file_progress.progress(file_index / total_files)
+
+            if file_index < total_files and inter_file_delay > 0:
+                time.sleep(inter_file_delay)
 
         file_status.success("All files processed.")
 
@@ -809,5 +867,6 @@ else:
 # ------------------------------------------------------------
 st.markdown("---")
 st.caption(
-    "Powered by Gemini API + direct structured parsing | Multi-file processing | Language-preserving export | ZIP export"
+    "Powered by Gemini API + direct structured parsing | Multi-file processing | "
+    "Language-preserving export | 429 backoff handling | ZIP export"
 )
