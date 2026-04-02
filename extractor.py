@@ -36,6 +36,11 @@ This tool extracts tender/product tables from uploaded files and converts them i
 
 The app tries to use **direct parsing first** for already-tabular files like XLSX / XLS / CSV / JSON.
 If needed, it falls back to AI extraction.
+
+**Language behavior**
+- Headers stay in the original source language
+- Values stay in the original source language
+- The app does not intentionally translate exported output into English
 """
 )
 
@@ -119,7 +124,11 @@ def normalize_cell_value(value):
     return str(value).strip()
 
 
-def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+def preserve_original_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean dataframe while preserving original column names and values.
+    No translation or renaming is performed.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -129,13 +138,17 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
         df[col] = df[col].map(normalize_cell_value)
 
+    # Drop fully empty rows
     df = df.loc[~(df.apply(lambda row: all(v == "" for v in row), axis=1))].copy()
+
+    # Drop duplicate rows
     df = df.drop_duplicates().reset_index(drop=True)
+
     return df
 
 
 def merge_dfs(dfs):
-    valid = [normalize_df(df) for df in dfs if df is not None and not df.empty]
+    valid = [preserve_original_columns(df) for df in dfs if df is not None and not df.empty]
     if not valid:
         return pd.DataFrame()
 
@@ -147,7 +160,7 @@ def merge_dfs(dfs):
 
     aligned = [df.reindex(columns=all_columns, fill_value="") for df in valid]
     merged = pd.concat(aligned, ignore_index=True)
-    return normalize_df(merged)
+    return preserve_original_columns(merged)
 
 
 def clean_llm_json(text_response: str) -> str:
@@ -187,6 +200,33 @@ def chunk_text(text: str, max_chars: int = 12000):
         chunks.append("\n".join(current).strip())
 
     return [c for c in chunks if c.strip()]
+
+
+def looks_like_useful_table(df: pd.DataFrame) -> bool:
+    """
+    Structural heuristic only.
+    Language-agnostic by design.
+    """
+    if df is None or df.empty:
+        return False
+
+    df = preserve_original_columns(df)
+
+    if df.empty:
+        return False
+
+    rows, cols = df.shape
+    if cols < 2:
+        return False
+
+    non_empty_cells = (df != "").sum().sum()
+    if non_empty_cells < max(6, rows * 2):
+        return False
+
+    if rows >= 2 and cols >= 2:
+        return True
+
+    return False
 
 
 # ------------------------------------------------------------
@@ -249,86 +289,38 @@ def build_zip(results, formats):
                     content = get_export_bytes(df, fmt)
                     zip_file.writestr(f"{base_name}.{fmt}", content)
                 except Exception as exc:
-                    zip_file.writestr(f"{base_name}_{fmt}_ERROR.txt", str(exc).encode("utf-8"))
+                    zip_file.writestr(
+                        f"{base_name}_{fmt}_ERROR.txt",
+                        str(exc).encode("utf-8")
+                    )
 
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
 
 
 # ------------------------------------------------------------
-# Heuristics for structured direct parsing
-# ------------------------------------------------------------
-EXPECTED_HINTS = [
-    "id", "description", "quantity", "unit", "unit price", "total estimated cost",
-    "total", "cpv", "price", "cost", "qty", "amount", "item"
-]
-
-
-def looks_like_useful_table(df: pd.DataFrame) -> bool:
-    if df is None or df.empty:
-        return False
-
-    df = normalize_df(df)
-
-    if df.empty:
-        return False
-
-    rows, cols = df.shape
-    if cols < 2:
-        return False
-
-    non_empty_cells = (df != "").sum().sum()
-    if non_empty_cells < max(6, rows * 2):
-        return False
-
-    header_text = " ".join([str(c).strip().lower() for c in df.columns])
-
-    if any(hint in header_text for hint in EXPECTED_HINTS):
-        return True
-
-    # fallback: enough rows and columns to still count as a real table
-    if rows >= 2 and cols >= 3:
-        return True
-
-    return False
-
-
-def standardize_known_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    rename_map = {}
-
-    for col in df.columns:
-        c = str(col).strip().lower()
-
-        if c in ["aa", "a/a", "no", "number", "id", "#", "α/α"]:
-            rename_map[col] = "ID"
-        elif c in ["description", "item", "name", "material", "specification", "περιγραφή"]:
-            rename_map[col] = "Description"
-        elif c in ["quantity", "qty", "ποσότητα"]:
-            rename_map[col] = "Quantity"
-        elif c in ["unit", "uom", "μονάδα"]:
-            rename_map[col] = "Unit"
-        elif c in ["unit price", "price per unit", "τιμή μονάδας"]:
-            rename_map[col] = "Unit Price"
-        elif c in ["total estimated cost", "total cost", "total", "budget", "estimated cost", "συνολικό κόστος"]:
-            rename_map[col] = "Total Estimated Cost"
-        elif c == "cpv":
-            rename_map[col] = "CPV"
-
-    df = df.rename(columns=rename_map)
-    return normalize_df(df)
-
-
-# ------------------------------------------------------------
-# Direct parsers
+# Direct parsers (language-preserving)
 # ------------------------------------------------------------
 def direct_parse_csv(uploaded_file):
     uploaded_file.seek(0)
-    df = pd.read_csv(uploaded_file, dtype=str).fillna("")
-    df = standardize_known_columns(df)
-    return df if looks_like_useful_table(df) else pd.DataFrame()
+
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
+    separators = [",", ";", "\t", "|"]
+
+    raw = uploaded_file.read()
+
+    for enc in encodings:
+        for sep in separators:
+            try:
+                text = raw.decode(enc)
+                df = pd.read_csv(BytesIO(text.encode("utf-8")), sep=sep, dtype=str).fillna("")
+                df = preserve_original_columns(df)
+                if looks_like_useful_table(df):
+                    return df
+            except Exception:
+                continue
+
+    return pd.DataFrame()
 
 
 def direct_parse_json(uploaded_file):
@@ -342,15 +334,14 @@ def direct_parse_json(uploaded_file):
 
     if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
         df = pd.DataFrame(parsed)
-        df = standardize_known_columns(df)
+        df = preserve_original_columns(df)
         return df if looks_like_useful_table(df) else pd.DataFrame()
 
     if isinstance(parsed, dict):
-        # try common nested list structures
         for value in parsed.values():
             if isinstance(value, list) and value and isinstance(value[0], dict):
                 df = pd.DataFrame(value)
-                df = standardize_known_columns(df)
+                df = preserve_original_columns(df)
                 if looks_like_useful_table(df):
                     return df
 
@@ -365,7 +356,7 @@ def direct_parse_excel(uploaded_file):
     for sheet_name in xls.sheet_names:
         try:
             df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str).fillna("")
-            df = standardize_known_columns(df)
+            df = preserve_original_columns(df)
             if looks_like_useful_table(df):
                 if len(xls.sheet_names) > 1 and "Source Sheet" not in df.columns:
                     df.insert(0, "Source Sheet", sheet_name)
@@ -434,8 +425,16 @@ def extract_text_from_xlsx(uploaded_file) -> str:
 
 def extract_text_from_csv(uploaded_file) -> str:
     uploaded_file.seek(0)
-    df = pd.read_csv(uploaded_file, dtype=str).fillna("")
-    return df.to_csv(index=False)
+    raw = uploaded_file.read()
+
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
+    for enc in encodings:
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+
+    return raw.decode("utf-8", errors="ignore")
 
 
 def extract_text_from_json(uploaded_file) -> str:
@@ -481,7 +480,7 @@ def extract_text_for_llm(uploaded_file):
 
 
 # ------------------------------------------------------------
-# AI path
+# AI path (language-preserving prompt)
 # ------------------------------------------------------------
 def build_prompt(file_name: str, chunk_text_value: str, chunk_index: int, total_chunks: int) -> str:
     return f"""
@@ -489,21 +488,16 @@ Analyze the following extracted content from file "{file_name}".
 This is chunk {chunk_index} of {total_chunks}.
 
 Your task:
-1. Extract ALL products/materials/items listed in tables or structured procurement sections.
+1. Extract all products/materials/items listed in tables or structured procurement sections.
 2. Return ONLY a valid JSON array.
 3. Do not include markdown, explanations, headings, or comments.
 4. Preserve one object per product/item row.
-5. Prefer these keys when possible:
-   - "ID"
-   - "Description"
-   - "Quantity"
-   - "Unit"
-   - "Unit Price"
-   - "Total Estimated Cost"
-   - "CPV"
-6. Include other meaningful columns too, but use English keys.
-7. If a field is missing, use an empty string.
-8. If this chunk has no identifiable product table, return [].
+5. Keep headers / field names in their ORIGINAL language whenever possible.
+6. Keep all values in their ORIGINAL language.
+7. Do NOT translate anything into English.
+8. Preserve the wording from the source as faithfully as possible.
+9. If a field is missing, use an empty string.
+10. If this chunk has no identifiable product/material table, return [].
 
 CONTENT:
 {chunk_text_value}
@@ -532,7 +526,9 @@ def call_gemini_once(api_key: str, prompt: str, timeout_seconds: int):
     try:
         text_response = res_json["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
-        raise RuntimeError(f"Unexpected Gemini response: {json.dumps(res_json, ensure_ascii=False)[:2000]}")
+        raise RuntimeError(
+            f"Unexpected Gemini response: {json.dumps(res_json, ensure_ascii=False)[:2000]}"
+        )
 
     cleaned = clean_llm_json(text_response)
 
@@ -548,7 +544,7 @@ def call_gemini_once(api_key: str, prompt: str, timeout_seconds: int):
         raise RuntimeError("Gemini response is not a JSON array.")
 
     df = pd.DataFrame(data)
-    return standardize_known_columns(df)
+    return preserve_original_columns(df)
 
 
 def call_gemini_with_retry(api_key: str, prompt: str, timeout_seconds: int, max_retries: int):
@@ -606,7 +602,7 @@ def process_file_with_ai(uploaded_file, api_key: str, chunk_size: int, timeout_s
                 timeout_seconds=timeout_seconds,
                 max_retries=max_retries,
             )
-            df = normalize_df(df)
+            df = preserve_original_columns(df)
             if not df.empty:
                 dfs.append(df)
 
@@ -808,11 +804,10 @@ if results:
 else:
     st.info("Upload files, choose output formats, and click **Process Files**.")
 
-
 # ------------------------------------------------------------
 # Footer
 # ------------------------------------------------------------
 st.markdown("---")
 st.caption(
-    "Powered by Gemini API + direct structured parsing | Multi-file processing | ZIP export"
+    "Powered by Gemini API + direct structured parsing | Multi-file processing | Language-preserving export | ZIP export"
 )
