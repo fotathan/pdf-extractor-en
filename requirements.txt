@@ -3,3 +3,6 @@ pdfplumber
 pandas
 requests
 openpyxl
+python-docx
+tabulate
+xlrd
