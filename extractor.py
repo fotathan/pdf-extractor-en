@@ -17,7 +17,7 @@ into structured Excel files. It automatically handles multi-page tables and vary
 # --- Sidebar / Input Fields ---
 st.sidebar.header("Configuration")
 api_key = st.sidebar.text_input("1. Gemini API Key", type="password", help="Enter your Google AI Studio API Key")
-uploaded_file = st.file_uploader("2. Upload Tender PDF (Prokiriksi)", type="pdf")
+uploaded_file = st.file_uploader("2. Upload Tender PDF", type="pdf")
 
 if api_key and uploaded_file:
     
