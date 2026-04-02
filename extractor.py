@@ -34,7 +34,8 @@ This tool extracts tender/product tables from uploaded files and converts them i
 - Markdown
 - JSON
 
-You can upload multiple files, process them one after the other, and download everything as a ZIP.
+The app tries to use **direct parsing first** for already-tabular files like XLSX / XLS / CSV / JSON.
+If needed, it falls back to AI extraction.
 """
 )
 
@@ -86,6 +87,15 @@ max_retries = st.sidebar.slider(
     step=1,
 )
 
+direct_parse_mode = st.sidebar.selectbox(
+    "7. Structured file handling",
+    options=[
+        "Use direct parsing first",
+        "Always use AI",
+    ],
+    index=0,
+)
+
 run_button = st.sidebar.button("🚀 Process Files", type="primary")
 
 # ------------------------------------------------------------
@@ -95,55 +105,12 @@ if "results" not in st.session_state:
     st.session_state.results = []
 
 # ------------------------------------------------------------
-# Helpers
+# Utility helpers
 # ------------------------------------------------------------
 def safe_filename(name: str) -> str:
     stem = Path(name).stem
     stem = re.sub(r"[^\w\-.]+", "_", stem, flags=re.UNICODE)
     return stem[:120] if stem else "output"
-
-
-def clean_llm_json(text_response: str) -> str:
-    text_response = text_response.strip()
-
-    if text_response.startswith("```json"):
-        text_response = text_response[7:]
-    elif text_response.startswith("```"):
-        text_response = text_response[3:]
-
-    if text_response.endswith("```"):
-        text_response = text_response[:-3]
-
-    return text_response.strip()
-
-
-def chunk_text(text: str, max_chars: int = 12000):
-    """
-    Split text into chunks on line boundaries where possible.
-    """
-    if not text:
-        return []
-
-    lines = text.splitlines()
-    chunks = []
-    current = []
-
-    current_len = 0
-    for line in lines:
-        line_len = len(line) + 1
-
-        if current and current_len + line_len > max_chars:
-            chunks.append("\n".join(current).strip())
-            current = [line]
-            current_len = line_len
-        else:
-            current.append(line)
-            current_len += line_len
-
-    if current:
-        chunks.append("\n".join(current).strip())
-
-    return [c for c in chunks if c.strip()]
 
 
 def normalize_cell_value(value):
@@ -162,12 +129,8 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
         df[col] = df[col].map(normalize_cell_value)
 
-    # Drop fully empty rows
     df = df.loc[~(df.apply(lambda row: all(v == "" for v in row), axis=1))].copy()
-
-    # Deduplicate
     df = df.drop_duplicates().reset_index(drop=True)
-
     return df
 
 
@@ -176,22 +139,59 @@ def merge_dfs(dfs):
     if not valid:
         return pd.DataFrame()
 
-    # Union columns across chunk results
     all_columns = []
     for df in valid:
         for c in df.columns:
             if c not in all_columns:
                 all_columns.append(c)
 
-    aligned = []
-    for df in valid:
-        aligned.append(df.reindex(columns=all_columns, fill_value=""))
-
+    aligned = [df.reindex(columns=all_columns, fill_value="") for df in valid]
     merged = pd.concat(aligned, ignore_index=True)
-    merged = normalize_df(merged)
-    return merged
+    return normalize_df(merged)
 
 
+def clean_llm_json(text_response: str) -> str:
+    text_response = text_response.strip()
+
+    if text_response.startswith("```json"):
+        text_response = text_response[7:]
+    elif text_response.startswith("```"):
+        text_response = text_response[3:]
+
+    if text_response.endswith("```"):
+        text_response = text_response[:-3]
+
+    return text_response.strip()
+
+
+def chunk_text(text: str, max_chars: int = 12000):
+    if not text:
+        return []
+
+    lines = text.splitlines()
+    chunks = []
+    current = []
+    current_len = 0
+
+    for line in lines:
+        line_len = len(line) + 1
+        if current and current_len + line_len > max_chars:
+            chunks.append("\n".join(current).strip())
+            current = [line]
+            current_len = line_len
+        else:
+            current.append(line)
+            current_len += line_len
+
+    if current:
+        chunks.append("\n".join(current).strip())
+
+    return [c for c in chunks if c.strip()]
+
+
+# ------------------------------------------------------------
+# Export helpers
+# ------------------------------------------------------------
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -204,8 +204,7 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 def df_to_html_bytes(df: pd.DataFrame) -> bytes:
-    html = df.to_html(index=False, border=1)
-    return html.encode("utf-8")
+    return df.to_html(index=False, border=1).encode("utf-8")
 
 
 def df_to_md_bytes(df: pd.DataFrame) -> bytes:
@@ -234,6 +233,152 @@ def get_export_bytes(df: pd.DataFrame, fmt: str) -> bytes:
     raise ValueError(f"Unsupported format: {fmt}")
 
 
+def build_zip(results, formats):
+    zip_buffer = BytesIO()
+
+    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        for result in results:
+            if result["status"] != "success":
+                continue
+
+            df = result["df"]
+            base_name = safe_filename(result["file_name"])
+
+            for fmt in formats:
+                try:
+                    content = get_export_bytes(df, fmt)
+                    zip_file.writestr(f"{base_name}.{fmt}", content)
+                except Exception as exc:
+                    zip_file.writestr(f"{base_name}_{fmt}_ERROR.txt", str(exc).encode("utf-8"))
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+
+# ------------------------------------------------------------
+# Heuristics for structured direct parsing
+# ------------------------------------------------------------
+EXPECTED_HINTS = [
+    "id", "description", "quantity", "unit", "unit price", "total estimated cost",
+    "total", "cpv", "price", "cost", "qty", "amount", "item"
+]
+
+
+def looks_like_useful_table(df: pd.DataFrame) -> bool:
+    if df is None or df.empty:
+        return False
+
+    df = normalize_df(df)
+
+    if df.empty:
+        return False
+
+    rows, cols = df.shape
+    if cols < 2:
+        return False
+
+    non_empty_cells = (df != "").sum().sum()
+    if non_empty_cells < max(6, rows * 2):
+        return False
+
+    header_text = " ".join([str(c).strip().lower() for c in df.columns])
+
+    if any(hint in header_text for hint in EXPECTED_HINTS):
+        return True
+
+    # fallback: enough rows and columns to still count as a real table
+    if rows >= 2 and cols >= 3:
+        return True
+
+    return False
+
+
+def standardize_known_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    rename_map = {}
+
+    for col in df.columns:
+        c = str(col).strip().lower()
+
+        if c in ["aa", "a/a", "no", "number", "id", "#", "α/α"]:
+            rename_map[col] = "ID"
+        elif c in ["description", "item", "name", "material", "specification", "περιγραφή"]:
+            rename_map[col] = "Description"
+        elif c in ["quantity", "qty", "ποσότητα"]:
+            rename_map[col] = "Quantity"
+        elif c in ["unit", "uom", "μονάδα"]:
+            rename_map[col] = "Unit"
+        elif c in ["unit price", "price per unit", "τιμή μονάδας"]:
+            rename_map[col] = "Unit Price"
+        elif c in ["total estimated cost", "total cost", "total", "budget", "estimated cost", "συνολικό κόστος"]:
+            rename_map[col] = "Total Estimated Cost"
+        elif c == "cpv":
+            rename_map[col] = "CPV"
+
+    df = df.rename(columns=rename_map)
+    return normalize_df(df)
+
+
+# ------------------------------------------------------------
+# Direct parsers
+# ------------------------------------------------------------
+def direct_parse_csv(uploaded_file):
+    uploaded_file.seek(0)
+    df = pd.read_csv(uploaded_file, dtype=str).fillna("")
+    df = standardize_known_columns(df)
+    return df if looks_like_useful_table(df) else pd.DataFrame()
+
+
+def direct_parse_json(uploaded_file):
+    uploaded_file.seek(0)
+    raw = uploaded_file.read().decode("utf-8", errors="ignore")
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return pd.DataFrame()
+
+    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+        df = pd.DataFrame(parsed)
+        df = standardize_known_columns(df)
+        return df if looks_like_useful_table(df) else pd.DataFrame()
+
+    if isinstance(parsed, dict):
+        # try common nested list structures
+        for value in parsed.values():
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                df = pd.DataFrame(value)
+                df = standardize_known_columns(df)
+                if looks_like_useful_table(df):
+                    return df
+
+    return pd.DataFrame()
+
+
+def direct_parse_excel(uploaded_file):
+    uploaded_file.seek(0)
+    xls = pd.ExcelFile(uploaded_file)
+    dfs = []
+
+    for sheet_name in xls.sheet_names:
+        try:
+            df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str).fillna("")
+            df = standardize_known_columns(df)
+            if looks_like_useful_table(df):
+                if len(xls.sheet_names) > 1 and "Source Sheet" not in df.columns:
+                    df.insert(0, "Source Sheet", sheet_name)
+                dfs.append(df)
+        except Exception:
+            continue
+
+    return merge_dfs(dfs)
+
+
+# ------------------------------------------------------------
+# Text extraction for AI path
+# ------------------------------------------------------------
 def extract_text_from_pdf(uploaded_file) -> str:
     uploaded_file.seek(0)
     chunks = []
@@ -253,12 +398,10 @@ def extract_text_from_docx(uploaded_file) -> str:
 
     chunks = []
 
-    # Paragraphs
     para_texts = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
     if para_texts:
         chunks.append("DOCUMENT TEXT:\n" + "\n".join(para_texts))
 
-    # Tables
     for table_index, table in enumerate(doc.tables, start=1):
         table_rows = []
         for row in table.rows:
@@ -337,6 +480,9 @@ def extract_text_for_llm(uploaded_file):
     return "", f"Unsupported file type: {suffix}"
 
 
+# ------------------------------------------------------------
+# AI path
+# ------------------------------------------------------------
 def build_prompt(file_name: str, chunk_text_value: str, chunk_index: int, total_chunks: int) -> str:
     return f"""
 Analyze the following extracted content from file "{file_name}".
@@ -381,7 +527,6 @@ def call_gemini_once(api_key: str, prompt: str, timeout_seconds: int):
     )
 
     response.raise_for_status()
-
     res_json = response.json()
 
     try:
@@ -402,7 +547,8 @@ def call_gemini_once(api_key: str, prompt: str, timeout_seconds: int):
     if not isinstance(data, list):
         raise RuntimeError("Gemini response is not a JSON array.")
 
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    return standardize_known_columns(df)
 
 
 def call_gemini_with_retry(api_key: str, prompt: str, timeout_seconds: int, max_retries: int):
@@ -416,7 +562,6 @@ def call_gemini_with_retry(api_key: str, prompt: str, timeout_seconds: int, max_
         except requests.exceptions.ConnectionError as exc:
             last_error = exc
         except requests.exceptions.HTTPError as exc:
-            # Retry only on 429 / 5xx
             status_code = exc.response.status_code if exc.response is not None else None
             if status_code in [429, 500, 502, 503, 504]:
                 last_error = exc
@@ -426,13 +571,12 @@ def call_gemini_with_retry(api_key: str, prompt: str, timeout_seconds: int, max_
             raise
 
         if attempt < max_retries:
-            sleep_seconds = 2 ** attempt
-            time.sleep(sleep_seconds)
+            time.sleep(2 ** attempt)
 
     raise last_error if last_error else RuntimeError("Gemini call failed.")
 
 
-def process_file(uploaded_file, api_key: str, chunk_size: int, timeout_seconds: int, max_retries: int):
+def process_file_with_ai(uploaded_file, api_key: str, chunk_size: int, timeout_seconds: int, max_retries: int):
     extracted_text, error = extract_text_for_llm(uploaded_file)
     if error:
         return None, error, []
@@ -490,35 +634,49 @@ def process_file(uploaded_file, api_key: str, chunk_size: int, timeout_seconds: 
     return final_df, None, per_chunk_logs
 
 
-def build_zip(results, formats):
-    zip_buffer = BytesIO()
+# ------------------------------------------------------------
+# Main file processor
+# ------------------------------------------------------------
+def try_direct_parse(uploaded_file):
+    suffix = Path(uploaded_file.name).suffix.lower()
 
-    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-        for result in results:
-            if result["status"] != "success":
-                continue
+    if suffix == ".csv":
+        return direct_parse_csv(uploaded_file), "direct_csv"
+    if suffix == ".json":
+        return direct_parse_json(uploaded_file), "direct_json"
+    if suffix in [".xlsx", ".xls"]:
+        return direct_parse_excel(uploaded_file), "direct_excel"
 
-            df = result["df"]
-            base_name = safe_filename(result["file_name"])
+    return pd.DataFrame(), "not_applicable"
 
-            for fmt in formats:
-                try:
-                    content = get_export_bytes(df, fmt)
-                    zip_file.writestr(f"{base_name}.{fmt}", content)
-                except Exception as exc:
-                    zip_file.writestr(f"{base_name}_{fmt}_ERROR.txt", str(exc).encode("utf-8"))
 
-    zip_buffer.seek(0)
-    return zip_buffer.getvalue()
+def process_uploaded_file(uploaded_file, api_key: str, chunk_size: int, timeout_seconds: int, max_retries: int, direct_parse_mode: str):
+    used_method = ""
+    chunk_logs = []
+
+    if direct_parse_mode == "Use direct parsing first":
+        direct_df, used_method = try_direct_parse(uploaded_file)
+        if direct_df is not None and not direct_df.empty:
+            return direct_df, None, chunk_logs, used_method
+
+    if not api_key:
+        return None, "Gemini API Key is required for AI extraction.", chunk_logs, used_method or "ai_required"
+
+    ai_df, error, chunk_logs = process_file_with_ai(
+        uploaded_file=uploaded_file,
+        api_key=api_key,
+        chunk_size=chunk_size,
+        timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+    )
+    return ai_df, error, chunk_logs, "ai_extraction"
 
 
 # ------------------------------------------------------------
-# Main run
+# Run
 # ------------------------------------------------------------
 if run_button:
-    if not api_key:
-        st.error("Please enter your Gemini API Key.")
-    elif not uploaded_files:
+    if not uploaded_files:
         st.error("Please upload at least one file.")
     elif not output_formats:
         st.error("Please select at least one output format.")
@@ -533,12 +691,13 @@ if run_button:
             file_status.info(f"Processing file {file_index}/{total_files}: {uploaded_file.name}")
 
             try:
-                df, error, chunk_logs = process_file(
+                df, error, chunk_logs, method_used = process_uploaded_file(
                     uploaded_file=uploaded_file,
                     api_key=api_key,
                     chunk_size=chunk_size,
                     timeout_seconds=timeout_seconds,
                     max_retries=max_retries,
+                    direct_parse_mode=direct_parse_mode,
                 )
 
                 if error:
@@ -549,6 +708,7 @@ if run_button:
                             "error": error,
                             "df": None,
                             "chunk_logs": chunk_logs,
+                            "method_used": method_used,
                         }
                     )
                 else:
@@ -559,6 +719,7 @@ if run_button:
                             "error": None,
                             "df": df if df is not None else pd.DataFrame(),
                             "chunk_logs": chunk_logs,
+                            "method_used": method_used,
                         }
                     )
 
@@ -570,12 +731,14 @@ if run_button:
                         "error": str(exc),
                         "df": None,
                         "chunk_logs": [],
+                        "method_used": "unknown",
                     }
                 )
 
             file_progress.progress(file_index / total_files)
 
         file_status.success("All files processed.")
+
 
 # ------------------------------------------------------------
 # Results
@@ -614,6 +777,8 @@ if results:
 
     for result in results:
         with st.expander(f"📄 {result['file_name']} — {result['status'].upper()}", expanded=False):
+            st.write(f"**Method used:** {result.get('method_used', '')}")
+
             if result["status"] == "error":
                 st.error(result["error"])
             else:
@@ -643,10 +808,11 @@ if results:
 else:
     st.info("Upload files, choose output formats, and click **Process Files**.")
 
+
 # ------------------------------------------------------------
 # Footer
 # ------------------------------------------------------------
 st.markdown("---")
 st.caption(
-    "Powered by Gemini API | Multi-file processing | Chunked AI requests to reduce timeouts"
+    "Powered by Gemini API + direct structured parsing | Multi-file processing | ZIP export"
 )
