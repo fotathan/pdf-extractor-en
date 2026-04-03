@@ -131,7 +131,7 @@ inter_file_delay = st.sidebar.slider(
     step=0.5,
 )
 
-add_numeric_helper_columns = st.sidebar.checkbox(
+add_numeric_helper_columns_flag = st.sidebar.checkbox(
     "10. Add normalized numeric helper columns",
     value=True,
     help="Keeps original values unchanged and adds extra helper columns for numeric-looking fields.",
@@ -146,6 +146,20 @@ numeric_detection_threshold = st.sidebar.slider(
     help="A column gets a numeric helper version if this share of its non-empty values can be parsed as numbers.",
 )
 
+show_preview_before_processing = st.sidebar.checkbox(
+    "12. Show sheet/table preview before processing",
+    value=True,
+    help="Preview Excel sheets and detected tables before processing files.",
+)
+
+preview_rows = st.sidebar.slider(
+    "13. Preview rows",
+    min_value=3,
+    max_value=20,
+    value=8,
+    step=1,
+)
+
 run_button = st.sidebar.button("🚀 Process Files", type="primary")
 
 # ------------------------------------------------------------
@@ -156,6 +170,9 @@ if "results" not in st.session_state:
 
 if "last_gemini_call_ts" not in st.session_state:
     st.session_state.last_gemini_call_ts = 0.0
+
+if "preview_selections" not in st.session_state:
+    st.session_state.preview_selections = {}
 
 
 # ------------------------------------------------------------
@@ -278,16 +295,6 @@ def enforce_min_api_interval(min_interval_seconds: float):
 # Numeric normalization helpers
 # ------------------------------------------------------------
 def parse_localized_number(value):
-    """
-    Parse common localized numeric formats while preserving the original value elsewhere.
-    Examples handled:
-    - 1.234,56
-    - 1,234.56
-    - 12 345,00
-    - € 1.250,00
-    - (1.250,00)
-    - 15%
-    """
     if value is None:
         return None
 
@@ -302,7 +309,6 @@ def parse_localized_number(value):
         negative = True
         s = s[1:-1].strip()
 
-    # Keep only digits, separators, minus sign, percent sign, and spaces/apostrophes used as thousands separators
     s = re.sub(r"[^0-9,\.\-\' %]", "", s).strip()
 
     if s == "" or s in {"-", ".", ",", "%"}:
@@ -310,41 +316,31 @@ def parse_localized_number(value):
 
     percent = "%" in s
     s = s.replace("%", "").strip()
-
-    # remove spaces and apostrophes used as thousand separators
     s = s.replace(" ", "").replace("'", "")
 
-    # if multiple minus signs or minus in wrong place, reject
     if s.count("-") > 1:
         return None
     if "-" in s and not s.startswith("-"):
         return None
 
-    # Determine decimal separator
     comma_count = s.count(",")
     dot_count = s.count(".")
 
     if comma_count > 0 and dot_count > 0:
-        # last separator is usually decimal separator
         if s.rfind(",") > s.rfind("."):
-            # comma decimal, dot thousands
             s = s.replace(".", "")
             s = s.replace(",", ".")
         else:
-            # dot decimal, comma thousands
             s = s.replace(",", "")
     elif comma_count > 0:
         if comma_count > 1:
             parts = s.split(",")
-            # if groups after first are 3 digits, commas likely thousands separators
             if all(len(p) == 3 for p in parts[1:] if p != ""):
                 s = "".join(parts)
             else:
-                # last comma decimal, previous commas thousands
                 s = "".join(parts[:-1]) + "." + parts[-1]
         else:
             left, right = s.split(",", 1)
-            # If exactly 3 digits after separator and enough digits before, often thousands sep
             if right.isdigit() and len(right) == 3 and len(left.replace("-", "")) >= 1:
                 s = left + right
             else:
@@ -388,11 +384,6 @@ def should_add_numeric_helper(series: pd.Series, threshold: float = 0.6) -> bool
 
 
 def add_numeric_helper_columns(df: pd.DataFrame, threshold: float = 0.6) -> pd.DataFrame:
-    """
-    Adds helper numeric columns without modifying original columns.
-    New helper column naming:
-    <original column> [num]
-    """
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -402,7 +393,6 @@ def add_numeric_helper_columns(df: pd.DataFrame, threshold: float = 0.6) -> pd.D
     original_columns = list(df.columns)
 
     for col in original_columns:
-        # avoid re-processing already generated helper columns
         if str(col).endswith(" [num]"):
             continue
 
@@ -410,8 +400,6 @@ def add_numeric_helper_columns(df: pd.DataFrame, threshold: float = 0.6) -> pd.D
         if should_add_numeric_helper(series, threshold=threshold):
             helper_col_name = f"{col} [num]"
             parsed_values = [parse_localized_number(v) for v in series]
-
-            # keep helper as numeric dtype when possible
             helper_columns[helper_col_name] = pd.to_numeric(parsed_values, errors="coerce")
 
     if not helper_columns:
@@ -428,6 +416,224 @@ def finalize_output_df(df: pd.DataFrame, add_numeric_helpers: bool, threshold: f
     if add_numeric_helpers:
         df = add_numeric_helper_columns(df, threshold=threshold)
     return df
+
+
+# ------------------------------------------------------------
+# Preview helpers
+# ------------------------------------------------------------
+def get_excel_sheet_previews(uploaded_file, max_rows: int = 8):
+    uploaded_file.seek(0)
+    previews = []
+
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+    except Exception:
+        return previews
+
+    for sheet_name in xls.sheet_names:
+        try:
+            df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str).fillna("")
+            df = preserve_original_columns(df)
+            previews.append(
+                {
+                    "sheet_name": sheet_name,
+                    "rows": len(df),
+                    "cols": len(df.columns),
+                    "looks_useful": looks_like_useful_table(df),
+                    "preview_df": df.head(max_rows),
+                }
+            )
+        except Exception as exc:
+            previews.append(
+                {
+                    "sheet_name": sheet_name,
+                    "rows": 0,
+                    "cols": 0,
+                    "looks_useful": False,
+                    "preview_df": pd.DataFrame({"Error": [str(exc)]}),
+                }
+            )
+
+    return previews
+
+
+def get_pdf_table_previews(uploaded_file, max_rows: int = 8):
+    uploaded_file.seek(0)
+    previews = []
+
+    try:
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                try:
+                    tables = page.extract_tables(
+                        table_settings={
+                            "vertical_strategy": "lines",
+                            "horizontal_strategy": "lines",
+                            "intersection_tolerance": 5,
+                            "snap_tolerance": 3,
+                            "join_tolerance": 3,
+                            "edge_min_length": 3,
+                            "min_words_vertical": 1,
+                            "min_words_horizontal": 1,
+                        }
+                    )
+                except Exception:
+                    tables = []
+
+                for table_index, table in enumerate(tables, start=1):
+                    if not table:
+                        continue
+
+                    cleaned_rows = []
+                    max_cols = 0
+
+                    for row in table:
+                        if not row:
+                            continue
+                        cleaned_row = []
+                        for cell in row:
+                            cleaned_row.append("" if cell is None else str(cell).replace("\n", " ").strip())
+                        if any(cell != "" for cell in cleaned_row):
+                            cleaned_rows.append(cleaned_row)
+                            max_cols = max(max_cols, len(cleaned_row))
+
+                    if len(cleaned_rows) < 2 or max_cols < 2:
+                        continue
+
+                    normalized_rows = [row + [""] * (max_cols - len(row)) for row in cleaned_rows]
+                    preview_df = pd.DataFrame(normalized_rows[:max_rows])
+
+                    previews.append(
+                        {
+                            "page_num": page_num,
+                            "table_index": table_index,
+                            "rows": len(cleaned_rows),
+                            "cols": max_cols,
+                            "preview_df": preview_df,
+                        }
+                    )
+    except Exception:
+        return previews
+
+    return previews
+
+
+def get_docx_table_previews(uploaded_file, max_rows: int = 8):
+    uploaded_file.seek(0)
+    previews = []
+
+    try:
+        doc = Document(uploaded_file)
+    except Exception:
+        return previews
+
+    for table_index, table in enumerate(doc.tables, start=1):
+        rows = []
+        max_cols = 0
+        for row in table.rows:
+            row_cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+            if any(cell != "" for cell in row_cells):
+                rows.append(row_cells)
+                max_cols = max(max_cols, len(row_cells))
+
+        if len(rows) < 2 or max_cols < 2:
+            continue
+
+        normalized_rows = [row + [""] * (max_cols - len(row)) for row in rows]
+        preview_df = pd.DataFrame(normalized_rows[:max_rows])
+
+        previews.append(
+            {
+                "table_index": table_index,
+                "rows": len(rows),
+                "cols": max_cols,
+                "preview_df": preview_df,
+            }
+        )
+
+    return previews
+
+
+def render_previews(uploaded_files, preview_rows: int):
+    if not uploaded_files:
+        return
+
+    st.markdown("## Preview before processing")
+
+    for uploaded_file in uploaded_files:
+        suffix = Path(uploaded_file.name).suffix.lower()
+        file_key = safe_filename(uploaded_file.name)
+
+        with st.expander(f"Preview: {uploaded_file.name}", expanded=False):
+            if suffix in [".xlsx", ".xls"]:
+                sheet_previews = get_excel_sheet_previews(uploaded_file, max_rows=preview_rows)
+
+                if not sheet_previews:
+                    st.info("No sheet preview available.")
+                    continue
+
+                available_sheets = [p["sheet_name"] for p in sheet_previews]
+                default_sheets = [p["sheet_name"] for p in sheet_previews if p["looks_useful"]]
+                if not default_sheets:
+                    default_sheets = available_sheets
+
+                selection_key = f"sheet_select_{file_key}"
+                selected_sheets = st.multiselect(
+                    f"Sheets to process for {uploaded_file.name}",
+                    options=available_sheets,
+                    default=st.session_state.preview_selections.get(selection_key, default_sheets),
+                    key=selection_key,
+                )
+                st.session_state.preview_selections[selection_key] = selected_sheets
+
+                for p in sheet_previews:
+                    badge = "✅ likely useful" if p["looks_useful"] else "⚪ preview only"
+                    st.markdown(
+                        f"**Sheet:** {p['sheet_name']} | Rows: {p['rows']} | Columns: {p['cols']} | {badge}"
+                    )
+                    st.dataframe(p["preview_df"], use_container_width=True)
+
+            elif suffix == ".pdf":
+                table_previews = get_pdf_table_previews(uploaded_file, max_rows=preview_rows)
+                if not table_previews:
+                    st.info("No detectable PDF tables found in preview. The file can still be processed via text extraction.")
+                else:
+                    st.markdown(f"Detected **{len(table_previews)}** PDF table(s).")
+                    for p in table_previews:
+                        st.markdown(
+                            f"**Page {p['page_num']} - Table {p['table_index']}** | Rows: {p['rows']} | Columns: {p['cols']}"
+                        )
+                        st.dataframe(p["preview_df"], use_container_width=True)
+
+            elif suffix == ".docx":
+                table_previews = get_docx_table_previews(uploaded_file, max_rows=preview_rows)
+                if not table_previews:
+                    st.info("No DOCX tables found in preview.")
+                else:
+                    st.markdown(f"Detected **{len(table_previews)}** DOCX table(s).")
+                    for p in table_previews:
+                        st.markdown(
+                            f"**Table {p['table_index']}** | Rows: {p['rows']} | Columns: {p['cols']}"
+                        )
+                        st.dataframe(p["preview_df"], use_container_width=True)
+
+            elif suffix in [".csv", ".json"]:
+                try:
+                    if suffix == ".csv":
+                        df = direct_parse_csv(uploaded_file)
+                    else:
+                        df = direct_parse_json(uploaded_file)
+
+                    if df is None or df.empty:
+                        st.info("No structured preview available.")
+                    else:
+                        st.markdown(f"Rows: **{len(df)}** | Columns: **{len(df.columns)}**")
+                        st.dataframe(df.head(preview_rows), use_container_width=True)
+                except Exception as exc:
+                    st.error(f"Preview failed: {exc}")
+
+            else:
+                st.info("Preview not available for this file type.")
 
 
 # ------------------------------------------------------------
@@ -549,17 +755,19 @@ def direct_parse_json(uploaded_file):
     return pd.DataFrame()
 
 
-def direct_parse_excel(uploaded_file):
+def direct_parse_excel(uploaded_file, selected_sheets=None):
     uploaded_file.seek(0)
     xls = pd.ExcelFile(uploaded_file)
     dfs = []
 
-    for sheet_name in xls.sheet_names:
+    sheet_names = selected_sheets if selected_sheets else xls.sheet_names
+
+    for sheet_name in sheet_names:
         try:
             df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str).fillna("")
             df = preserve_original_columns(df)
             if looks_like_useful_table(df):
-                if len(xls.sheet_names) > 1 and "Source Sheet" not in df.columns:
+                if len(sheet_names) > 1 and "Source Sheet" not in df.columns:
                     df.insert(0, "Source Sheet", sheet_name)
                 dfs.append(df)
         except Exception:
@@ -674,12 +882,14 @@ def extract_text_from_docx(uploaded_file) -> str:
     return "\n\n".join(chunks).strip()
 
 
-def extract_text_from_xlsx(uploaded_file) -> str:
+def extract_text_from_xlsx(uploaded_file, selected_sheets=None) -> str:
     uploaded_file.seek(0)
     xls = pd.ExcelFile(uploaded_file)
     chunks = []
 
-    for sheet_name in xls.sheet_names:
+    sheet_names = selected_sheets if selected_sheets else xls.sheet_names
+
+    for sheet_name in sheet_names:
         try:
             df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str)
             df = df.fillna("")
@@ -729,7 +939,7 @@ def extract_text_from_text_like(uploaded_file) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
-def extract_text_for_llm(uploaded_file):
+def extract_text_for_llm(uploaded_file, selected_sheets=None):
     suffix = Path(uploaded_file.name).suffix.lower()
 
     if suffix == ".pdf":
@@ -737,7 +947,7 @@ def extract_text_for_llm(uploaded_file):
     if suffix == ".docx":
         return extract_text_from_docx(uploaded_file), None
     if suffix in [".xlsx", ".xls"]:
-        return extract_text_from_xlsx(uploaded_file), None
+        return extract_text_from_xlsx(uploaded_file, selected_sheets=selected_sheets), None
     if suffix == ".csv":
         return extract_text_from_csv(uploaded_file), None
     if suffix == ".json":
@@ -749,7 +959,7 @@ def extract_text_for_llm(uploaded_file):
 
 
 # ------------------------------------------------------------
-# AI path (language-preserving prompt)
+# AI path
 # ------------------------------------------------------------
 def build_prompt(file_name: str, chunk_text_value: str, chunk_index: int, total_chunks: int) -> str:
     return f"""
@@ -903,8 +1113,9 @@ def process_file_with_ai(
     timeout_seconds: int,
     max_retries: int,
     min_api_interval_seconds: float,
+    selected_sheets=None,
 ):
-    extracted_text, error = extract_text_for_llm(uploaded_file)
+    extracted_text, error = extract_text_for_llm(uploaded_file, selected_sheets=selected_sheets)
     if error:
         return None, error, []
 
@@ -980,6 +1191,12 @@ def process_file_with_ai(
 # ------------------------------------------------------------
 # Main file processor
 # ------------------------------------------------------------
+def get_selected_sheets_for_file(uploaded_file):
+    selection_key = f"sheet_select_{safe_filename(uploaded_file.name)}"
+    selected = st.session_state.preview_selections.get(selection_key, [])
+    return selected if selected else None
+
+
 def try_direct_parse(uploaded_file):
     suffix = Path(uploaded_file.name).suffix.lower()
 
@@ -988,7 +1205,8 @@ def try_direct_parse(uploaded_file):
     if suffix == ".json":
         return direct_parse_json(uploaded_file), "direct_json"
     if suffix in [".xlsx", ".xls"]:
-        return direct_parse_excel(uploaded_file), "direct_excel"
+        selected_sheets = get_selected_sheets_for_file(uploaded_file)
+        return direct_parse_excel(uploaded_file, selected_sheets=selected_sheets), "direct_excel"
 
     return pd.DataFrame(), "not_applicable"
 
@@ -1006,6 +1224,7 @@ def process_uploaded_file(
 ):
     used_method = ""
     chunk_logs = []
+    selected_sheets = get_selected_sheets_for_file(uploaded_file)
 
     if direct_parse_mode == "Use direct parsing first":
         direct_df, used_method = try_direct_parse(uploaded_file)
@@ -1027,6 +1246,7 @@ def process_uploaded_file(
         timeout_seconds=timeout_seconds,
         max_retries=max_retries,
         min_api_interval_seconds=min_api_interval_seconds,
+        selected_sheets=selected_sheets,
     )
 
     if ai_df is not None and not ai_df.empty:
@@ -1037,6 +1257,13 @@ def process_uploaded_file(
         )
 
     return ai_df, error, chunk_logs, "ai_extraction"
+
+
+# ------------------------------------------------------------
+# Preview section
+# ------------------------------------------------------------
+if uploaded_files and show_preview_before_processing:
+    render_previews(uploaded_files, preview_rows)
 
 
 # ------------------------------------------------------------
@@ -1066,7 +1293,7 @@ if run_button:
                     max_retries=max_retries,
                     direct_parse_mode=direct_parse_mode,
                     min_api_interval_seconds=min_api_interval_seconds,
-                    add_numeric_helpers=add_numeric_helper_columns,
+                    add_numeric_helpers=add_numeric_helper_columns_flag,
                     numeric_threshold=numeric_detection_threshold,
                 )
 
@@ -1179,7 +1406,8 @@ if results:
                 st.dataframe(pd.DataFrame(result["chunk_logs"]), use_container_width=True)
 
 else:
-    st.info("Upload files, choose output formats, and click **Process Files**.")
+    st.info("Upload files, preview sheets/tables if needed, choose output formats, and click **Process Files**.")
+
 
 # ------------------------------------------------------------
 # Footer
@@ -1187,5 +1415,6 @@ else:
 st.markdown("---")
 st.caption(
     "Powered by Gemini API + direct structured parsing | Multi-file processing | "
-    "Language-preserving export | PDF table-first extraction | numeric helper columns | stronger 429 protection | ZIP export"
+    "Language-preserving export | PDF table-first extraction | numeric helper columns | "
+    "sheet/table preview before processing | stronger 429 protection | ZIP export"
 )
