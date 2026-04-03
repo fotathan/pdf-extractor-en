@@ -77,7 +77,7 @@ uploaded_files = st.file_uploader(
 output_formats = st.sidebar.multiselect(
     "3. Output formats",
     options=["xlsx", "csv", "html", "md", "json"],
-    default=["xlsx", "csv", "json"],
+    default=["xlsx"],
 )
 
 chunk_size = st.sidebar.slider(
