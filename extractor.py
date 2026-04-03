@@ -84,7 +84,7 @@ chunk_size = st.sidebar.slider(
     "4. Chunk size (characters per AI request)",
     min_value=4000,
     max_value=30000,
-    value=18000,
+    value=22000,
     step=1000,
     help="Larger chunks reduce request count. Too small a chunk size can increase 429 errors.",
 )
@@ -101,7 +101,7 @@ max_retries = st.sidebar.slider(
     "6. Retries per chunk",
     min_value=0,
     max_value=5,
-    value=2,
+    value=1,
     step=1,
 )
 
@@ -118,7 +118,7 @@ min_api_interval_seconds = st.sidebar.slider(
     "8. Minimum interval between Gemini calls (seconds)",
     min_value=0.0,
     max_value=30.0,
-    value=12.0,
+    value=15.0,
     step=1.0,
     help="Global pacing between Gemini requests. Helps reduce 429 errors much more effectively than short chunk delays.",
 )
@@ -127,7 +127,7 @@ inter_file_delay = st.sidebar.slider(
     "9. Delay between files (seconds)",
     min_value=0.0,
     max_value=20.0,
-    value=3.0,
+    value=5.0,
     step=0.5,
 )
 
