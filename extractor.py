@@ -50,6 +50,10 @@ If needed, it falls back to AI extraction.
 - Headers stay in the original source language
 - Values stay in the original source language
 - The app does not intentionally translate exported output into English
+
+**Numeric handling**
+- Original values are preserved
+- Optional helper numeric columns can be added for easier sorting/filtering/analysis
 """
 )
 
@@ -125,6 +129,21 @@ inter_file_delay = st.sidebar.slider(
     max_value=20.0,
     value=3.0,
     step=0.5,
+)
+
+add_numeric_helper_columns = st.sidebar.checkbox(
+    "10. Add normalized numeric helper columns",
+    value=True,
+    help="Keeps original values unchanged and adds extra helper columns for numeric-looking fields.",
+)
+
+numeric_detection_threshold = st.sidebar.slider(
+    "11. Numeric detection threshold",
+    min_value=0.3,
+    max_value=1.0,
+    value=0.6,
+    step=0.05,
+    help="A column gets a numeric helper version if this share of its non-empty values can be parsed as numbers.",
 )
 
 run_button = st.sidebar.button("🚀 Process Files", type="primary")
@@ -253,6 +272,162 @@ def enforce_min_api_interval(min_interval_seconds: float):
         time.sleep(min_interval_seconds - elapsed)
 
     st.session_state["last_gemini_call_ts"] = time.time()
+
+
+# ------------------------------------------------------------
+# Numeric normalization helpers
+# ------------------------------------------------------------
+def parse_localized_number(value):
+    """
+    Parse common localized numeric formats while preserving the original value elsewhere.
+    Examples handled:
+    - 1.234,56
+    - 1,234.56
+    - 12 345,00
+    - € 1.250,00
+    - (1.250,00)
+    - 15%
+    """
+    if value is None:
+        return None
+
+    s = str(value).strip()
+    if s == "":
+        return None
+
+    s = s.replace("\u00A0", " ").replace("\u202F", " ").strip()
+
+    negative = False
+    if s.startswith("(") and s.endswith(")"):
+        negative = True
+        s = s[1:-1].strip()
+
+    # Keep only digits, separators, minus sign, percent sign, and spaces/apostrophes used as thousands separators
+    s = re.sub(r"[^0-9,\.\-\' %]", "", s).strip()
+
+    if s == "" or s in {"-", ".", ",", "%"}:
+        return None
+
+    percent = "%" in s
+    s = s.replace("%", "").strip()
+
+    # remove spaces and apostrophes used as thousand separators
+    s = s.replace(" ", "").replace("'", "")
+
+    # if multiple minus signs or minus in wrong place, reject
+    if s.count("-") > 1:
+        return None
+    if "-" in s and not s.startswith("-"):
+        return None
+
+    # Determine decimal separator
+    comma_count = s.count(",")
+    dot_count = s.count(".")
+
+    if comma_count > 0 and dot_count > 0:
+        # last separator is usually decimal separator
+        if s.rfind(",") > s.rfind("."):
+            # comma decimal, dot thousands
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
+        else:
+            # dot decimal, comma thousands
+            s = s.replace(",", "")
+    elif comma_count > 0:
+        if comma_count > 1:
+            parts = s.split(",")
+            # if groups after first are 3 digits, commas likely thousands separators
+            if all(len(p) == 3 for p in parts[1:] if p != ""):
+                s = "".join(parts)
+            else:
+                # last comma decimal, previous commas thousands
+                s = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            left, right = s.split(",", 1)
+            # If exactly 3 digits after separator and enough digits before, often thousands sep
+            if right.isdigit() and len(right) == 3 and len(left.replace("-", "")) >= 1:
+                s = left + right
+            else:
+                s = left + "." + right
+    elif dot_count > 0:
+        if dot_count > 1:
+            parts = s.split(".")
+            if all(len(p) == 3 for p in parts[1:] if p != ""):
+                s = "".join(parts)
+            else:
+                s = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            left, right = s.split(".", 1)
+            if right.isdigit() and len(right) == 3 and len(left.replace("-", "")) >= 1:
+                s = left + right
+
+    try:
+        number = float(s)
+    except Exception:
+        return None
+
+    if negative:
+        number = -number
+
+    if percent:
+        return number / 100.0
+
+    return number
+
+
+def should_add_numeric_helper(series: pd.Series, threshold: float = 0.6) -> bool:
+    values = [str(v).strip() for v in series if str(v).strip() != ""]
+    if len(values) < 2:
+        return False
+
+    parsed = [parse_localized_number(v) for v in values]
+    parsed_ok = sum(v is not None for v in parsed)
+    ratio = parsed_ok / len(values) if values else 0.0
+
+    return ratio >= threshold and parsed_ok >= 2
+
+
+def add_numeric_helper_columns(df: pd.DataFrame, threshold: float = 0.6) -> pd.DataFrame:
+    """
+    Adds helper numeric columns without modifying original columns.
+    New helper column naming:
+    <original column> [num]
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = preserve_original_columns(df)
+
+    helper_columns = {}
+    original_columns = list(df.columns)
+
+    for col in original_columns:
+        # avoid re-processing already generated helper columns
+        if str(col).endswith(" [num]"):
+            continue
+
+        series = df[col]
+        if should_add_numeric_helper(series, threshold=threshold):
+            helper_col_name = f"{col} [num]"
+            parsed_values = [parse_localized_number(v) for v in series]
+
+            # keep helper as numeric dtype when possible
+            helper_columns[helper_col_name] = pd.to_numeric(parsed_values, errors="coerce")
+
+    if not helper_columns:
+        return df
+
+    for helper_name, helper_series in helper_columns.items():
+        df[helper_name] = helper_series
+
+    return df
+
+
+def finalize_output_df(df: pd.DataFrame, add_numeric_helpers: bool, threshold: float) -> pd.DataFrame:
+    df = preserve_original_columns(df)
+    if add_numeric_helpers:
+        df = add_numeric_helper_columns(df, threshold=threshold)
+    return df
 
 
 # ------------------------------------------------------------
@@ -404,7 +579,6 @@ def extract_text_from_pdf(uploaded_file) -> str:
         for page_num, page in enumerate(pdf.pages, start=1):
             page_parts = []
 
-            # 1) Try table extraction first
             try:
                 tables = page.extract_tables(
                     table_settings={
@@ -445,7 +619,6 @@ def extract_text_from_pdf(uploaded_file) -> str:
                         cleaned_rows.append(cleaned_row)
                         max_cols = max(max_cols, len(cleaned_row))
 
-                # Skip tiny/noisy tables
                 if len(cleaned_rows) < 2 or max_cols < 2:
                     continue
 
@@ -456,7 +629,6 @@ def extract_text_from_pdf(uploaded_file) -> str:
                     padded = row + [""] * (max_cols - len(row))
                     page_parts.append(" | ".join(padded))
 
-            # 2) Fallback / supplementary page text
             page_text = ""
             try:
                 page_text = page.extract_text() or ""
@@ -829,6 +1001,8 @@ def process_uploaded_file(
     max_retries: int,
     direct_parse_mode: str,
     min_api_interval_seconds: float,
+    add_numeric_helpers: bool,
+    numeric_threshold: float,
 ):
     used_method = ""
     chunk_logs = []
@@ -836,6 +1010,11 @@ def process_uploaded_file(
     if direct_parse_mode == "Use direct parsing first":
         direct_df, used_method = try_direct_parse(uploaded_file)
         if direct_df is not None and not direct_df.empty:
+            direct_df = finalize_output_df(
+                direct_df,
+                add_numeric_helpers=add_numeric_helpers,
+                threshold=numeric_threshold,
+            )
             return direct_df, None, chunk_logs, used_method
 
     if not api_key:
@@ -849,6 +1028,14 @@ def process_uploaded_file(
         max_retries=max_retries,
         min_api_interval_seconds=min_api_interval_seconds,
     )
+
+    if ai_df is not None and not ai_df.empty:
+        ai_df = finalize_output_df(
+            ai_df,
+            add_numeric_helpers=add_numeric_helpers,
+            threshold=numeric_threshold,
+        )
+
     return ai_df, error, chunk_logs, "ai_extraction"
 
 
@@ -879,6 +1066,8 @@ if run_button:
                     max_retries=max_retries,
                     direct_parse_mode=direct_parse_mode,
                     min_api_interval_seconds=min_api_interval_seconds,
+                    add_numeric_helpers=add_numeric_helper_columns,
+                    numeric_threshold=numeric_detection_threshold,
                 )
 
                 if error:
@@ -998,5 +1187,5 @@ else:
 st.markdown("---")
 st.caption(
     "Powered by Gemini API + direct structured parsing | Multi-file processing | "
-    "Language-preserving export | PDF table-first extraction | stronger 429 protection | ZIP export"
+    "Language-preserving export | PDF table-first extraction | numeric helper columns | stronger 429 protection | ZIP export"
 )
