@@ -402,11 +402,82 @@ def extract_text_from_pdf(uploaded_file) -> str:
 
     with pdfplumber.open(uploaded_file) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text()
-            if text and text.strip():
-                chunks.append(f"\n--- PAGE {page_num} ---\n{text}")
+            page_parts = []
 
-    return "\n".join(chunks).strip()
+            # 1) Try table extraction first
+            try:
+                tables = page.extract_tables(
+                    table_settings={
+                        "vertical_strategy": "lines",
+                        "horizontal_strategy": "lines",
+                        "intersection_tolerance": 5,
+                        "snap_tolerance": 3,
+                        "join_tolerance": 3,
+                        "edge_min_length": 3,
+                        "min_words_vertical": 1,
+                        "min_words_horizontal": 1,
+                    }
+                )
+            except Exception:
+                tables = []
+
+            useful_tables_found = 0
+
+            for table_index, table in enumerate(tables, start=1):
+                if not table:
+                    continue
+
+                cleaned_rows = []
+                max_cols = 0
+
+                for row in table:
+                    if not row:
+                        continue
+
+                    cleaned_row = []
+                    for cell in row:
+                        if cell is None:
+                            cleaned_row.append("")
+                        else:
+                            cleaned_row.append(str(cell).replace("\n", " ").strip())
+
+                    if any(cell != "" for cell in cleaned_row):
+                        cleaned_rows.append(cleaned_row)
+                        max_cols = max(max_cols, len(cleaned_row))
+
+                # Skip tiny/noisy tables
+                if len(cleaned_rows) < 2 or max_cols < 2:
+                    continue
+
+                useful_tables_found += 1
+
+                page_parts.append(f"--- PAGE {page_num} | TABLE {table_index} ---")
+                for row in cleaned_rows:
+                    padded = row + [""] * (max_cols - len(row))
+                    page_parts.append(" | ".join(padded))
+
+            # 2) Fallback / supplementary page text
+            page_text = ""
+            try:
+                page_text = page.extract_text() or ""
+            except Exception:
+                page_text = ""
+
+            page_text = page_text.strip()
+
+            if useful_tables_found > 0:
+                if page_text:
+                    page_parts.append(f"--- PAGE {page_num} | TEXT ---")
+                    page_parts.append(page_text)
+            else:
+                if page_text:
+                    page_parts.append(f"--- PAGE {page_num} ---")
+                    page_parts.append(page_text)
+
+            if page_parts:
+                chunks.append("\n".join(page_parts))
+
+    return "\n\n".join(chunks).strip()
 
 
 def extract_text_from_docx(uploaded_file) -> str:
@@ -512,6 +583,11 @@ def build_prompt(file_name: str, chunk_text_value: str, chunk_index: int, total_
     return f"""
 Analyze the following extracted content from file "{file_name}".
 This is chunk {chunk_index} of {total_chunks}.
+
+Important:
+- Some parts may come from PDF table extraction.
+- Rows written with "|" separators usually represent table rows and columns.
+- Treat those rows as structured table data whenever possible.
 
 Your task:
 1. Extract all products/materials/items listed in tables or structured procurement sections.
@@ -916,12 +992,11 @@ if results:
 else:
     st.info("Upload files, choose output formats, and click **Process Files**.")
 
-
 # ------------------------------------------------------------
 # Footer
 # ------------------------------------------------------------
 st.markdown("---")
 st.caption(
     "Powered by Gemini API + direct structured parsing | Multi-file processing | "
-    "Language-preserving export | stronger 429 protection | ZIP export"
+    "Language-preserving export | PDF table-first extraction | stronger 429 protection | ZIP export"
 )
