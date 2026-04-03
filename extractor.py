@@ -148,7 +148,7 @@ numeric_detection_threshold = st.sidebar.slider(
 
 show_preview_before_processing = st.sidebar.checkbox(
     "12. Show sheet/table preview before processing",
-    value=True,
+    value=False,
     help="Preview Excel sheets and detected tables before processing files.",
 )
 
