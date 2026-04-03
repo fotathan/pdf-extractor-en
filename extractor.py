@@ -11,6 +11,14 @@ from io import BytesIO
 from pathlib import Path
 from docx import Document
 
+
+# ------------------------------------------------------------
+# Custom exceptions
+# ------------------------------------------------------------
+class RateLimitError(Exception):
+    pass
+
+
 # ------------------------------------------------------------
 # Page configuration
 # ------------------------------------------------------------
@@ -71,10 +79,10 @@ output_formats = st.sidebar.multiselect(
 chunk_size = st.sidebar.slider(
     "4. Chunk size (characters per AI request)",
     min_value=4000,
-    max_value=25000,
-    value=15000,
+    max_value=30000,
+    value=18000,
     step=1000,
-    help="Smaller chunks reduce timeout risk but increase number of API calls.",
+    help="Larger chunks reduce request count. Too small a chunk size can increase 429 errors.",
 )
 
 timeout_seconds = st.sidebar.slider(
@@ -89,7 +97,7 @@ max_retries = st.sidebar.slider(
     "6. Retries per chunk",
     min_value=0,
     max_value=5,
-    value=1,
+    value=2,
     step=1,
 )
 
@@ -102,22 +110,21 @@ direct_parse_mode = st.sidebar.selectbox(
     index=0,
 )
 
-inter_chunk_delay = st.sidebar.slider(
-    "8. Delay between AI chunk requests (seconds)",
+min_api_interval_seconds = st.sidebar.slider(
+    "8. Minimum interval between Gemini calls (seconds)",
     min_value=0.0,
-    max_value=5.0,
-    value=1.5,
-    step=0.5,
-    help="Helps reduce 429 Too Many Requests errors.",
+    max_value=30.0,
+    value=12.0,
+    step=1.0,
+    help="Global pacing between Gemini requests. Helps reduce 429 errors much more effectively than short chunk delays.",
 )
 
 inter_file_delay = st.sidebar.slider(
     "9. Delay between files (seconds)",
     min_value=0.0,
-    max_value=10.0,
-    value=1.0,
+    max_value=20.0,
+    value=3.0,
     step=0.5,
-    help="Helps reduce bursts when processing many files.",
 )
 
 run_button = st.sidebar.button("🚀 Process Files", type="primary")
@@ -127,6 +134,10 @@ run_button = st.sidebar.button("🚀 Process Files", type="primary")
 # ------------------------------------------------------------
 if "results" not in st.session_state:
     st.session_state.results = []
+
+if "last_gemini_call_ts" not in st.session_state:
+    st.session_state.last_gemini_call_ts = 0.0
+
 
 # ------------------------------------------------------------
 # Utility helpers
@@ -188,7 +199,7 @@ def clean_llm_json(text_response: str) -> str:
     return text_response.strip()
 
 
-def chunk_text(text: str, max_chars: int = 15000):
+def chunk_text(text: str, max_chars: int = 18000):
     if not text:
         return []
 
@@ -231,6 +242,17 @@ def looks_like_useful_table(df: pd.DataFrame) -> bool:
         return False
 
     return rows >= 2 and cols >= 2
+
+
+def enforce_min_api_interval(min_interval_seconds: float):
+    now = time.time()
+    last_call = st.session_state.get("last_gemini_call_ts", 0.0)
+    elapsed = now - last_call
+
+    if elapsed < min_interval_seconds:
+        time.sleep(min_interval_seconds - elapsed)
+
+    st.session_state["last_gemini_call_ts"] = time.time()
 
 
 # ------------------------------------------------------------
@@ -508,7 +530,9 @@ CONTENT:
 """.strip()
 
 
-def call_gemini_once(api_key: str, prompt: str, timeout_seconds: int):
+def call_gemini_once(api_key: str, prompt: str, timeout_seconds: int, min_api_interval_seconds: float):
+    enforce_min_api_interval(min_api_interval_seconds)
+
     url = (
         "https://generativelanguage.googleapis.com/v1/models/"
         f"gemini-2.5-flash:generateContent?key={api_key}"
@@ -524,11 +548,10 @@ def call_gemini_once(api_key: str, prompt: str, timeout_seconds: int):
         timeout=timeout_seconds,
     )
 
+    st.session_state["last_gemini_call_ts"] = time.time()
+
     if response.status_code == 429:
-        raise requests.exceptions.HTTPError(
-            "429 Too Many Requests",
-            response=response
-        )
+        raise requests.exceptions.HTTPError("429 Too Many Requests", response=response)
 
     response.raise_for_status()
     res_json = response.json()
@@ -557,25 +580,47 @@ def call_gemini_once(api_key: str, prompt: str, timeout_seconds: int):
     return preserve_original_columns(df)
 
 
-def call_gemini_with_retry(api_key: str, prompt: str, timeout_seconds: int, max_retries: int):
+def call_gemini_with_retry(
+    api_key: str,
+    prompt: str,
+    timeout_seconds: int,
+    max_retries: int,
+    min_api_interval_seconds: float,
+):
     last_error = None
 
     for attempt in range(max_retries + 1):
         try:
-            return call_gemini_once(api_key, prompt, timeout_seconds)
+            return call_gemini_once(api_key, prompt, timeout_seconds, min_api_interval_seconds)
 
         except requests.exceptions.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
 
             if status_code == 429:
                 last_error = exc
+
+                retry_after = None
+                if exc.response is not None:
+                    retry_after = exc.response.headers.get("Retry-After")
+
+                if retry_after:
+                    try:
+                        sleep_seconds = max(15, int(retry_after))
+                    except Exception:
+                        sleep_seconds = 30
+                else:
+                    if attempt == 0:
+                        sleep_seconds = random.uniform(20, 30)
+                    else:
+                        sleep_seconds = random.uniform(45, 60)
+
                 if attempt < max_retries:
-                    sleep_seconds = min(60, (2 ** attempt) + random.uniform(1.0, 3.0))
                     time.sleep(sleep_seconds)
                     continue
-                raise RuntimeError(
-                    "Gemini API rate limit reached (429 Too Many Requests). "
-                    "Please wait a bit and try again, or process fewer files/chunks at once."
+
+                raise RateLimitError(
+                    f"Gemini API rate limit reached (429). Cooldown needed. "
+                    f"Last wait was about {sleep_seconds:.1f} seconds."
                 )
 
             if status_code in [500, 502, 503, 504]:
@@ -588,33 +633,29 @@ def call_gemini_with_retry(api_key: str, prompt: str, timeout_seconds: int, max_
 
             raise
 
-        except requests.exceptions.ReadTimeout as exc:
-            last_error = exc
+        except requests.exceptions.ReadTimeout:
             if attempt < max_retries:
-                sleep_seconds = min(30, (2 ** attempt) + random.uniform(0.5, 2.0))
-                time.sleep(sleep_seconds)
+                time.sleep(min(30, (2 ** attempt) + random.uniform(0.5, 2.0)))
                 continue
-            raise RuntimeError(
-                "Gemini request timed out. Try a smaller chunk size or retry later."
-            )
+            raise RuntimeError("Gemini request timed out. Try a larger chunk size or retry later.")
 
-        except requests.exceptions.ConnectionError as exc:
-            last_error = exc
+        except requests.exceptions.ConnectionError:
             if attempt < max_retries:
-                sleep_seconds = min(30, (2 ** attempt) + random.uniform(0.5, 2.0))
-                time.sleep(sleep_seconds)
+                time.sleep(min(30, (2 ** attempt) + random.uniform(0.5, 2.0)))
                 continue
-            raise RuntimeError(
-                "Network connection error while contacting Gemini."
-            )
-
-        except Exception:
-            raise
+            raise RuntimeError("Network connection error while contacting Gemini.")
 
     raise last_error if last_error else RuntimeError("Gemini call failed.")
 
 
-def process_file_with_ai(uploaded_file, api_key: str, chunk_size: int, timeout_seconds: int, max_retries: int, inter_chunk_delay: float):
+def process_file_with_ai(
+    uploaded_file,
+    api_key: str,
+    chunk_size: int,
+    timeout_seconds: int,
+    max_retries: int,
+    min_api_interval_seconds: float,
+):
     extracted_text, error = extract_text_for_llm(uploaded_file)
     if error:
         return None, error, []
@@ -643,6 +684,7 @@ def process_file_with_ai(uploaded_file, api_key: str, chunk_size: int, timeout_s
                 prompt=prompt,
                 timeout_seconds=timeout_seconds,
                 max_retries=max_retries,
+                min_api_interval_seconds=min_api_interval_seconds,
             )
             df = preserve_original_columns(df)
             if not df.empty:
@@ -656,6 +698,18 @@ def process_file_with_ai(uploaded_file, api_key: str, chunk_size: int, timeout_s
                     "error": "",
                 }
             )
+
+        except RateLimitError as exc:
+            per_chunk_logs.append(
+                {
+                    "chunk": idx,
+                    "status": "rate_limited",
+                    "rows": 0,
+                    "error": str(exc),
+                }
+            )
+            break
+
         except Exception as exc:
             per_chunk_logs.append(
                 {
@@ -668,8 +722,8 @@ def process_file_with_ai(uploaded_file, api_key: str, chunk_size: int, timeout_s
 
         chunk_progress.progress(idx / len(text_chunks))
 
-        if idx < len(text_chunks) and inter_chunk_delay > 0:
-            time.sleep(inter_chunk_delay)
+    if per_chunk_logs and any(log["status"] == "rate_limited" for log in per_chunk_logs):
+        return None, "Processing stopped because the Gemini API rate limit was reached.", per_chunk_logs
 
     final_df = merge_dfs(dfs)
     return final_df, None, per_chunk_logs
@@ -698,7 +752,7 @@ def process_uploaded_file(
     timeout_seconds: int,
     max_retries: int,
     direct_parse_mode: str,
-    inter_chunk_delay: float,
+    min_api_interval_seconds: float,
 ):
     used_method = ""
     chunk_logs = []
@@ -717,7 +771,7 @@ def process_uploaded_file(
         chunk_size=chunk_size,
         timeout_seconds=timeout_seconds,
         max_retries=max_retries,
-        inter_chunk_delay=inter_chunk_delay,
+        min_api_interval_seconds=min_api_interval_seconds,
     )
     return ai_df, error, chunk_logs, "ai_extraction"
 
@@ -748,7 +802,7 @@ if run_button:
                     timeout_seconds=timeout_seconds,
                     max_retries=max_retries,
                     direct_parse_mode=direct_parse_mode,
-                    inter_chunk_delay=inter_chunk_delay,
+                    min_api_interval_seconds=min_api_interval_seconds,
                 )
 
                 if error:
@@ -862,11 +916,12 @@ if results:
 else:
     st.info("Upload files, choose output formats, and click **Process Files**.")
 
+
 # ------------------------------------------------------------
 # Footer
 # ------------------------------------------------------------
 st.markdown("---")
 st.caption(
     "Powered by Gemini API + direct structured parsing | Multi-file processing | "
-    "Language-preserving export | 429 backoff handling | ZIP export"
+    "Language-preserving export | stronger 429 protection | ZIP export"
 )
